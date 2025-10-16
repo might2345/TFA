@@ -9,6 +9,8 @@ import threading
 import queue
 import time
 import math
+import os
+import sys
 
 
 @dataclass
@@ -27,55 +29,10 @@ class Vehicle:
     track_fail_count: int = 0
     active: bool = True
     bbox_history: deque = field(default_factory=lambda: deque(maxlen=10))
-
-
-class SpeedCalculator:
-
-    def __init__(self):
-        self.pixels_per_meter = None
-        self.calibration_done = False
-
-    def calibrate_perspective(self, frame):
-        h, w = frame.shape[:2]
-        self.pixels_per_meter = w / 50
-        self.calibration_done = True
-        return self.pixels_per_meter
-
-    def calculate_speed(self, vehicle: Vehicle, frame_shape) -> float:
-        if len(vehicle.positions) < 3:
-            return 0
-
-        if not self.calibration_done:
-            return 0
-
-        positions = list(vehicle.positions)
-        timestamps = list(vehicle.timestamps)
-
-        total_distance_m = 0
-        total_time = 0
-        valid_segments = 0
-
-        for i in range(1, min(5, len(positions))):
-            if len(positions) > i:
-                pos1 = positions[-i - 1]
-                pos2 = positions[-1]
-                time_diff = timestamps[-1] - timestamps[-i - 1]
-
-                if time_diff > 0.1:
-                    distance_px = math.sqrt((pos2[0] - pos1[0]) ** 2 + (pos2[1] - pos1[1]) ** 2)
-                    distance_m = distance_px / self.pixels_per_meter
-
-                    total_distance_m += distance_m
-                    total_time += time_diff
-                    valid_segments += 1
-
-        if total_time == 0 or valid_segments == 0:
-            return 0
-
-        average_speed_ms = total_distance_m / total_time
-        speed_kmh = average_speed_ms * 3.6
-
-        return max(0, speed_kmh)
+    distance_traveled: float = 0
+    last_speed_calc_time: float = 0
+    calibrated: bool = False
+    calibration_frames: int = 0
 
 
 class ImprovedVehicleTracker:
@@ -86,8 +43,15 @@ class ImprovedVehicleTracker:
         self.next_id = 1
         self.removed_vehicles = []
 
+        # Калибровочные параметры
+        self.calibration_data = {
+            'pixel_to_meter': 0.05,  # начальное приближение
+            'reference_speeds': [],  # для калибровки
+            'calibrated': False
+        }
+
     def update(self, detections, current_time, frame_shape):
-        """Update vehicle tracks with improved matching"""
+        """Update vehicle tracks with improved speed calculation"""
         h, w = frame_shape[:2]
 
         for vehicle in self.vehicles.values():
@@ -133,6 +97,13 @@ class ImprovedVehicleTracker:
 
             if best_match_id is not None and best_score > 0.3:
                 vehicle = self.vehicles[best_match_id]
+
+                # Расчет пройденного расстояния
+                if vehicle.positions:
+                    last_x, last_y = vehicle.positions[-1]
+                    pixel_distance = math.sqrt((cx - last_x) ** 2 + (cy - last_y) ** 2)
+                    vehicle.distance_traveled += pixel_distance * self.calibration_data['pixel_to_meter']
+
                 vehicle.positions.append((cx, cy))
                 vehicle.timestamps.append(current_time)
                 vehicle.confidence_history.append(confidence)
@@ -140,6 +111,13 @@ class ImprovedVehicleTracker:
                 vehicle.active = True
                 vehicle.last_detection_time = current_time
                 vehicle.track_fail_count = 0
+
+                # Калибровка для новых транспортных средств
+                if not vehicle.calibrated and vehicle.calibration_frames < 10:
+                    vehicle.calibration_frames += 1
+                    if vehicle.calibration_frames >= 5:
+                        vehicle.calibrated = True
+
                 used_ids.add(best_match_id)
             else:
                 vehicle_id = self.next_id
@@ -160,6 +138,13 @@ class ImprovedVehicleTracker:
                 self.vehicles[vehicle_id] = new_vehicle
                 used_ids.add(vehicle_id)
 
+        # Расчет скорости для всех активных транспортных средств
+        for vehicle in self.vehicles.values():
+            if vehicle.active and len(vehicle.positions) >= 2:
+                current_speed = self._calculate_speed(vehicle, current_time)
+                if current_speed is not None:
+                    vehicle.speeds.append(current_speed)
+
         to_remove = []
         for vehicle_id, vehicle in self.vehicles.items():
             if not vehicle.active:
@@ -176,6 +161,90 @@ class ImprovedVehicleTracker:
             del self.vehicles[vehicle_id]
 
         return used_ids
+
+    def _calculate_speed(self, vehicle: Vehicle, current_time: float) -> Optional[float]:
+        """Точный расчет скорости в км/ч"""
+        if len(vehicle.positions) < 2:
+            return None
+
+        # Используем несколько последних позиций для сглаживания
+        num_positions = min(5, len(vehicle.positions))
+        positions = list(vehicle.positions)[-num_positions:]
+        timestamps = list(vehicle.timestamps)[-num_positions:]
+
+        total_pixel_distance = 0
+        total_time = 0
+
+        for i in range(1, len(positions)):
+            x1, y1 = positions[i - 1]
+            x2, y2 = positions[i]
+
+            pixel_distance = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+            time_diff = timestamps[i] - timestamps[i - 1]
+
+            if time_diff > 0:
+                total_pixel_distance += pixel_distance
+                total_time += time_diff
+
+        if total_time <= 0:
+            return None
+
+        # Средняя скорость в пикселях в секунду
+        avg_pixel_speed = total_pixel_distance / total_time
+
+        # Конвертация в км/ч с калибровочным коэффициентом
+        speed_kmh = avg_pixel_speed * self.calibration_data['pixel_to_meter'] * 3.6
+
+        # Фильтрация реалистичных скоростей (исключаем аномалии)
+        if 0 <= speed_kmh <= 200:  # Реалистичный диапазон скоростей
+            return speed_kmh
+        else:
+            return None
+
+    def auto_calibrate(self, current_time: float, reference_speed_kmh: float = 90.0):
+        """Автоматическая калибровка на основе эталонной скорости"""
+        active_vehicles = self.get_active_vehicles()
+        if not active_vehicles:
+            return
+
+        # Берем транспортные средства с надежным трекингом
+        reliable_vehicles = []
+        for vehicle in active_vehicles:
+            if (len(vehicle.speeds) >= 3 and
+                    vehicle.calibrated and
+                    current_time - vehicle.first_detection_time > 2.0):
+                reliable_vehicles.append(vehicle)
+
+        if not reliable_vehicles:
+            return
+
+        # Рассчитываем среднюю скорость в пикселях/сек
+        total_pixel_speed = 0
+        count = 0
+
+        for vehicle in reliable_vehicles:
+            if vehicle.speeds:
+                # Преобразуем deque в list для среза
+                speeds_list = list(vehicle.speeds)
+                if len(speeds_list) >= 3:
+                    current_speed_kmh = np.mean(speeds_list[-3:])
+                    if 50 <= current_speed_kmh <= 120:
+                        # Обратный расчет пиксельной скорости
+                        pixel_speed = current_speed_kmh / (self.calibration_data['pixel_to_meter'] * 3.6)
+                        total_pixel_speed += pixel_speed
+                        count += 1
+
+        if count > 0:
+            avg_pixel_speed = total_pixel_speed / count
+            # Обновляем коэффициент калибровки
+            new_pixel_to_meter = reference_speed_kmh / (avg_pixel_speed * 3.6)
+
+            # Плавное обновление коэффициента
+            self.calibration_data['pixel_to_meter'] = (
+                    0.7 * self.calibration_data['pixel_to_meter'] +
+                    0.3 * new_pixel_to_meter
+            )
+            self.calibration_data['calibrated'] = True
 
     def get_active_vehicles(self):
         return [v for v in self.vehicles.values() if v.active]
@@ -194,25 +263,6 @@ class WiedemannModel:
         self.cc5 = 0.25
         self.cc8 = 2.0
         self.cc9 = 3.0
-
-    def calculate_safe_distance(self, speed_kmh: float, speed_leader_kmh: float = 0) -> float:
-        speed_ms = speed_kmh / 3.6
-        speed_leader_ms = speed_leader_kmh / 3.6
-
-        ax = self.cc0 + self.cc1 * speed_ms
-        delta_v = speed_ms - speed_leader_ms
-
-        if delta_v > 0:
-            sdv = self.cc2 + self.cc4 * delta_v
-        else:
-            sdv = self.cc2 + self.cc5 * delta_v
-
-        return max(ax + sdv, self.cc0)
-
-    def is_aggressive_following(self, distance: float, speed: float, speed_leader: float) -> bool:
-        """Check for aggressive following"""
-        safe_dist = self.calculate_safe_distance(speed, speed_leader)
-        return distance < safe_dist * 0.5
 
     def is_aggressive_acceleration(self, acceleration: float, vehicle_class: str) -> bool:
         thresholds = {
@@ -235,23 +285,42 @@ class WiedemannModel:
         threshold = thresholds.get(vehicle_class, -3.5)
         return deceleration < threshold
 
+    def is_speeding(self, speed: float, vehicle_class: str) -> bool:
+        """Проверка превышения скорости"""
+        speed_limits = {
+            "car": 120,
+            "motorcycle": 120,
+            "bus": 90,
+            "truck": 90
+        }
+        limit = speed_limits.get(vehicle_class, 120)
+        return speed > limit
+
+    def is_too_slow(self, speed: float, vehicle_class: str) -> bool:
+        """Проверка слишком медленной скорости"""
+        min_speeds = {
+            "car": 60,
+            "motorcycle": 60,
+            "bus": 50,
+            "truck": 50
+        }
+        min_speed = min_speeds.get(vehicle_class, 60)
+        return speed < min_speed
+
 
 class FrameProcessor:
-    """Improved frame processor without lane detection"""
+    """Improved frame processor with accurate speed detection"""
 
-    def __init__(self, model, wiedemann_model, tracker, speed_calculator):
+    def __init__(self, model, wiedemann_model, tracker):
         self.model = model
         self.wiedemann = wiedemann_model
         self.tracker = tracker
-        self.speed_calculator = speed_calculator
         self.frame_queue = queue.Queue(maxsize=20)
         self.result_queue = queue.Queue()
         self.stop_event = threading.Event()
 
-        self.SPEED_LIMIT_KMH = 100
-
-        self.calibration_done = False
-        self.calibration_frames = 0
+        self.last_calibration_time = 0
+        self.calibration_interval = 5.0  # калибровка каждые 5 секунд
 
     def process_frames(self):
         """Frame processing in separate thread"""
@@ -269,15 +338,10 @@ class FrameProcessor:
                 continue
 
     def _process_single_frame(self, frame: np.ndarray, frame_count: int, current_time: float):
-        """Process single frame without lane detection"""
+        """Process single frame with accurate speed detection"""
         h, w = frame.shape[:2]
 
-        if not self.calibration_done and self.calibration_frames < 5:
-            self.speed_calculator.calibrate_perspective(frame)
-            self.calibration_frames += 1
-            if self.calibration_frames >= 5:
-                self.calibration_done = True
-
+        # Детекция транспортных средств
         results = self.model(frame, classes=[2, 3, 5, 7],
                              verbose=False, conf=0.6, iou=0.5)
 
@@ -292,6 +356,11 @@ class FrameProcessor:
                     detections.append((box, conf, class_id))
 
         used_ids = self.tracker.update(detections, current_time, frame.shape)
+
+        # Периодическая калибровка
+        if current_time - self.last_calibration_time > self.calibration_interval:
+            self.tracker.auto_calibrate(current_time, 90.0)  # калибровка на 90 км/ч
+            self.last_calibration_time = current_time
 
         vehicles_data = []
         for vehicle in self.tracker.get_active_vehicles():
@@ -318,13 +387,15 @@ class FrameProcessor:
             if vehicle_box is None:
                 continue
 
-            speed = self.speed_calculator.calculate_speed(vehicle, frame.shape)
+            # Расчет ускорения
             acceleration = self._calculate_acceleration(vehicle)
+            if acceleration is not None:
+                vehicle.accelerations.append(acceleration)
 
-            vehicle.speeds.append(speed)
-            vehicle.accelerations.append(acceleration)
+            # Текущая скорость
+            current_speed = list(vehicle.speeds)[-1] if vehicle.speeds else 0
 
-            violations = self._detect_violations(vehicle, current_time, w, frame.shape[0])
+            violations = self._detect_violations(vehicle, current_time, current_speed)
 
             current_violations = set()
             for violation in violations:
@@ -344,11 +415,12 @@ class FrameProcessor:
                 'id': vehicle.id,
                 'box': [int(x) for x in vehicle_box],
                 'center': (cx, cy),
-                'speed': speed,
+                'speed': current_speed,
                 'violations': sustained_violations,
                 'is_aggressive': vehicle.is_aggressive,
                 'active': vehicle.active,
-                'vehicle_class': vehicle.vehicle_class
+                'vehicle_class': vehicle.vehicle_class,
+                'distance_traveled': vehicle.distance_traveled
             }
 
             vehicles_data.append(vehicle_data)
@@ -356,26 +428,27 @@ class FrameProcessor:
         return {
             'frame': frame.copy(),
             'vehicles_data': vehicles_data,
-            'frame_count': frame_count,
-            'calibrated': self.calibration_done
+            'frame_count': frame_count
         }
 
-    def _calculate_acceleration(self, vehicle: Vehicle) -> float:
+    def _calculate_acceleration(self, vehicle: Vehicle) -> Optional[float]:
         """Calculate acceleration in m/s² with smoothing"""
         if len(vehicle.speeds) < 3:
             return 0
 
-        speeds_ms = [s / 3.6 for s in list(vehicle.speeds)[-3:]]
+        speeds = list(vehicle.speeds)[-3:]
         timestamps = list(vehicle.timestamps)[-3:]
 
-        if len(speeds_ms) < 2:
+        if len(speeds) < 2:
             return 0
 
         accelerations = []
-        for i in range(1, len(speeds_ms)):
+        for i in range(1, len(speeds)):
             time_diff = timestamps[i] - timestamps[i - 1]
             if time_diff > 0:
-                accel = (speeds_ms[i] - speeds_ms[i - 1]) / time_diff
+                # Конвертация скорости из км/ч в м/с
+                speed_diff_ms = (speeds[i] - speeds[i - 1]) / 3.6
+                accel = speed_diff_ms / time_diff
                 accelerations.append(accel)
 
         if not accelerations:
@@ -383,24 +456,24 @@ class FrameProcessor:
 
         return sum(accelerations) / len(accelerations)
 
-    def _detect_violations(self, vehicle: Vehicle, current_time: float, frame_width: int, frame_height: int) -> List[
-        str]:
+    def _detect_violations(self, vehicle: Vehicle, current_time: float, current_speed: float) -> List[str]:
         violations = []
 
         if current_time - vehicle.first_detection_time < 2.0:
             return violations
 
-        if len(vehicle.speeds) < 5 or len(vehicle.positions) < 8:
+        if len(vehicle.positions) < 8:
             return violations
 
-        current_speed = vehicle.speeds[-1] if vehicle.speeds else 0
-        current_accel = vehicle.accelerations[-1] if vehicle.accelerations else 0
+        # Проверка скорости
+        if self.wiedemann.is_speeding(current_speed, vehicle.vehicle_class):
+            violations.append('speeding')
 
-        speed_samples = list(vehicle.speeds)[-5:]
-        if len(speed_samples) >= 3:
-            high_speed_count = sum(1 for s in speed_samples if s > self.SPEED_LIMIT_KMH * 1.1)
-            if high_speed_count >= 3:
-                violations.append('speeding')
+        if self.wiedemann.is_too_slow(current_speed, vehicle.vehicle_class):
+            violations.append('too_slow')
+
+        # Проверка ускорения/торможения
+        current_accel = list(vehicle.accelerations)[-1] if vehicle.accelerations else 0
 
         if (current_accel > 0 and
                 self.wiedemann.is_aggressive_acceleration(current_accel, vehicle.vehicle_class)):
@@ -410,43 +483,17 @@ class FrameProcessor:
                 self.wiedemann.is_aggressive_deceleration(current_accel, vehicle.vehicle_class)):
             violations.append('rapid_braking')
 
-        if vehicle.positions:
-            cx, cy = vehicle.positions[-1]
-            shoulder_width = frame_width // 8
-            if cx < shoulder_width or cx > frame_width - shoulder_width:
-                shoulder_time = 0
-                for pos in list(vehicle.positions)[-10:]:
-                    if pos[0] < shoulder_width or pos[0] > frame_width - shoulder_width:
-                        shoulder_time += 1
-
-                if shoulder_time >= 5:
-                    violations.append('shoulder_driving')
-
-        if len(vehicle.positions) >= 3 and vehicle.speeds:
-            current_speed = vehicle.speeds[-1]
-
-            if current_speed > 30:
-                following_too_close = False
-
-                if (current_speed > 50 and current_accel < -1.0 and
-                        len([a for a in list(vehicle.accelerations)[-5:] if a < -1.0]) >= 2):
-                    following_too_close = True
-
-                if following_too_close:
-                    violations.append('tailgating')
-
         return violations
 
 
 class TrafficAnalyzer:
-    """Final improved traffic analyzer without lane detection"""
+    """Final improved traffic analyzer with accurate speed detection"""
 
     VIOLATION_CATEGORIES = {
         'speeding': 'Speeding',
+        'too_slow': 'Too Slow',
         'rapid_acceleration': 'Rapid Acceleration',
-        'rapid_braking': 'Rapid Braking',
-        'shoulder_driving': 'Shoulder Driving',
-        'tailgating': 'Tailgating'
+        'rapid_braking': 'Rapid Braking'
     }
 
     def __init__(self, video_path: str, model_path: str = 'yolo11x.pt'):
@@ -454,16 +501,15 @@ class TrafficAnalyzer:
         self.model = YOLO(model_path)
         self.wiedemann = WiedemannModel()
         self.tracker = ImprovedVehicleTracker(max_age=4.0)
-        self.speed_calculator = SpeedCalculator()
 
         self.violation_stats = defaultdict(int)
         self.aggressive_drivers = set()
+        self.speed_stats = []
 
         self.fps = 0
         self.frame_count = 0
 
-        self.frame_processor = FrameProcessor(self.model, self.wiedemann,
-                                              self.tracker, self.speed_calculator)
+        self.frame_processor = FrameProcessor(self.model, self.wiedemann, self.tracker)
         self.processor_thread = None
 
     def process_video(self, output_path: str = 'output_analyzed.mp4',
@@ -526,8 +572,19 @@ class TrafficAnalyzer:
                     all_vehicles = len(self.tracker.get_all_analyzed_vehicles())
                     aggressive = len(self.aggressive_drivers)
 
+                    # Статистика скоростей
+                    speeds = []
+                    for vehicle in self.tracker.get_active_vehicles():
+                        if vehicle.speeds:
+                            # Преобразуем deque в list для среза
+                            speeds_list = list(vehicle.speeds)
+                            if len(speeds_list) >= 3:
+                                speeds.append(np.mean(speeds_list[-3:]))
+
+                    avg_speed = np.mean(speeds) if speeds else 0
+
                     print(
-                        f"Progress: {progress:.1f}% | Active: {active_vehicles} | Total: {all_vehicles} | Aggressive: {aggressive}")
+                        f"Progress: {progress:.1f}% | Active: {active_vehicles} | Total: {all_vehicles} | Aggressive: {aggressive} | Avg Speed: {avg_speed:.1f} km/h")
                     last_stats_time = time.time()
 
         except KeyboardInterrupt:
@@ -548,15 +605,14 @@ class TrafficAnalyzer:
     def _visualize_frame(self, processed_data: Dict, w: int, h: int) -> np.ndarray:
         frame = processed_data['frame']
         vehicles_data = processed_data['vehicles_data']
-        calibrated = processed_data.get('calibrated', False)
 
         for vehicle in vehicles_data:
             x1, y1, x2, y2 = vehicle['box']
             cx, cy = vehicle['center']
-            speed = vehicle['speed']
             violations = vehicle['violations']
             is_aggressive = vehicle['is_aggressive']
             vehicle_class = vehicle.get('vehicle_class', 'car')
+            speed = vehicle.get('speed', 0)
 
             if is_aggressive:
                 color = (0, 0, 255)
@@ -571,31 +627,44 @@ class TrafficAnalyzer:
             cv2.circle(frame, (cx, cy), 6, color, -1)
 
             class_symbol = {"car": "C", "motorcycle": "M", "bus": "B", "truck": "T"}.get(vehicle_class, "V")
-            info_text = f"ID:{vehicle['id']}({class_symbol}) {speed:.0f}km/h"
+            info_text = f"ID:{vehicle['id']}({class_symbol}) {speed:.1f}km/h"
             cv2.putText(frame, info_text, (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
+            # Отображение нарушений
             for i, violation in enumerate(violations[:2]):
                 viol_text = self.VIOLATION_CATEGORIES.get(violation, violation)
                 cv2.putText(frame, viol_text, (x1, y2 + 15 + i * 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
-        stats_bg = np.zeros((120, 450, 3), dtype=np.uint8)
-        frame[10:130, 10:460] = stats_bg
+        # Статистика
+        stats_bg = np.zeros((140, 500, 3), dtype=np.uint8)
+        frame[10:150, 10:510] = stats_bg
 
         active_vehicles = len(vehicles_data)
         total_tracked = len(self.tracker.get_all_analyzed_vehicles())
         aggressive_count = len(self.aggressive_drivers)
-        calibration_status = "CALIBRATED" if calibrated else "CALIBRATING"
 
-        cv2.putText(frame, f"Speed Calibration: {calibration_status}", (20, 35),
+        # Расчет средней скорости
+        speeds = []
+        for vehicle in self.tracker.get_active_vehicles():
+            if vehicle.speeds:
+                # Преобразуем deque в list для среза
+                speeds_list = list(vehicle.speeds)
+                if len(speeds_list) >= 3:
+                    speeds.append(np.mean(speeds_list[-3:]))
+        avg_speed = np.mean(speeds) if speeds else 0
+
+        cv2.putText(frame, f"Active vehicles: {active_vehicles}", (20, 35),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(frame, f"Active: {active_vehicles}", (20, 60),
+        cv2.putText(frame, f"Total tracked: {total_tracked}", (20, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(frame, f"Total: {total_tracked}", (20, 85),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(frame, f"Aggressive: {aggressive_count}", (20, 110),
+        cv2.putText(frame, f"Aggressive: {aggressive_count}", (20, 85),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255) if aggressive_count > 0 else (255, 255, 255), 2)
+        cv2.putText(frame, f"Avg speed: {avg_speed:.1f} km/h", (20, 110),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(frame, f"Calibration: {'ON' if self.tracker.calibration_data['calibrated'] else 'OFF'}",
+                    (20, 135), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
         return frame
 
@@ -603,6 +672,10 @@ class TrafficAnalyzer:
         """Update statistics"""
         for vehicle_data in processed_data['vehicles_data']:
             vehicle_id = vehicle_data['id']
+            speed = vehicle_data.get('speed', 0)
+
+            if speed > 0:
+                self.speed_stats.append(speed)
 
             if vehicle_data['is_aggressive']:
                 self.aggressive_drivers.add(vehicle_id)
@@ -625,6 +698,7 @@ class TrafficAnalyzer:
             normal_pct = 100 - aggressive_pct
 
         vehicle_types = defaultdict(int)
+
         for vehicle in all_vehicles:
             vehicle_types[vehicle.vehicle_class] += 1
 
@@ -635,6 +709,24 @@ class TrafficAnalyzer:
             violation_percentages[viol_name] = {
                 'count': count,
                 'percentage': round(pct, 2)
+            }
+
+        # Статистика скоростей
+        speed_stats = {}
+        if self.speed_stats:
+            speed_stats = {
+                'average_speed': round(np.mean(self.speed_stats), 2),
+                'min_speed': round(np.min(self.speed_stats), 2),
+                'max_speed': round(np.max(self.speed_stats), 2),
+                'speed_std': round(np.std(self.speed_stats), 2),
+                'speed_distribution': {
+                    '70-80 km/h': len([s for s in self.speed_stats if 70 <= s < 80]),
+                    '80-90 km/h': len([s for s in self.speed_stats if 80 <= s < 90]),
+                    '90-100 km/h': len([s for s in self.speed_stats if 90 <= s < 100]),
+                    '100-110 km/h': len([s for s in self.speed_stats if 100 <= s < 110]),
+                    '110-120 km/h': len([s for s in self.speed_stats if 110 <= s < 120]),
+                    '120+ km/h': len([s for s in self.speed_stats if s >= 120])
+                }
             }
 
         report = {
@@ -648,14 +740,14 @@ class TrafficAnalyzer:
                 'analysis_duration_seconds': round(self.frame_count / self.fps, 2),
                 'average_fps': round(self.fps, 2)
             },
+            'speed_statistics': speed_stats,
             'vehicle_type_distribution': dict(vehicle_types),
             'violations_breakdown': violation_percentages,
             'analysis_parameters': {
-                'speed_limit_kmh': 100,
                 'detection_confidence': 0.6,
                 'tracking_max_age_seconds': 4.0,
-                'lane_detection': 'Disabled',
-                'speed_calibration': 'Basic'
+                'speed_calibration': 'auto',
+                'calibration_reference_speed': '90 km/h'
             }
         }
 
@@ -673,6 +765,17 @@ class TrafficAnalyzer:
         for vtype, count in vehicle_types.items():
             pct = (count / total_tracked) * 100
             print(f"  {vtype}: {count} ({pct:.1f}%)")
+
+        print(f"\nSPEED STATISTICS:")
+        print("-" * 50)
+        if speed_stats:
+            print(f"Average speed: {speed_stats['average_speed']:.1f} km/h")
+            print(f"Speed range: {speed_stats['min_speed']:.1f} - {speed_stats['max_speed']:.1f} km/h")
+            print(f"Speed distribution:")
+            for range_name, count in speed_stats['speed_distribution'].items():
+                if count > 0:
+                    pct = (count / len(self.speed_stats)) * 100
+                    print(f"  {range_name}: {count} vehicles ({pct:.1f}%)")
 
         print(f"\nVIOLATION TYPES:")
         print("-" * 50)
@@ -697,7 +800,7 @@ def main():
     STATS_JSON = "traffic_statistics.json"
 
     try:
-        print("Starting traffic analyzer (without lane detection)...")
+        print("Starting traffic analyzer with accurate speed detection...")
         print("Initializing systems...")
 
         analyzer = TrafficAnalyzer(VIDEO_PATH)

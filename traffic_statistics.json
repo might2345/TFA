@@ -1,0 +1,55 @@
+{
+  "summary": {
+    "total_vehicles_tracked": 193,
+    "aggressive_drivers": 132,
+    "normal_drivers": 61,
+    "aggressive_percentage": 68.39,
+    "normal_percentage": 31.61,
+    "total_frames_processed": 1732,
+    "analysis_duration_seconds": 57.71,
+    "average_fps": 30.01
+  },
+  "speed_statistics": {
+    "average_speed": 57.9,
+    "min_speed": 0.87,
+    "max_speed": 199.7,
+    "speed_std": 46.28,
+    "speed_distribution": {
+      "70-80 km/h": 407,
+      "80-90 km/h": 380,
+      "90-100 km/h": 290,
+      "100-110 km/h": 280,
+      "110-120 km/h": 197,
+      "120+ km/h": 1033
+    }
+  },
+  "vehicle_type_distribution": {
+    "car": 145,
+    "truck": 47,
+    "motorcycle": 1
+  },
+  "violations_breakdown": {
+    "Speeding": {
+      "count": 1003,
+      "percentage": 519.69
+    },
+    "Too Slow": {
+      "count": 3101,
+      "percentage": 1606.74
+    },
+    "Rapid Acceleration": {
+      "count": 2770,
+      "percentage": 1435.23
+    },
+    "Rapid Braking": {
+      "count": 2668,
+      "percentage": 1382.38
+    }
+  },
+  "analysis_parameters": {
+    "detection_confidence": 0.6,
+    "tracking_max_age_seconds": 4.0,
+    "speed_calibration": "auto",
+    "calibration_reference_speed": "90 km/h"
+  }
+}
