@@ -692,7 +692,7 @@ class TrafficAnalyzer:
 
 
 def main():
-    VIDEO_PATH = "test4.mp4"
+    VIDEO_PATH = "input.mp4"
     OUTPUT_VIDEO = "output.mp4"
     STATS_JSON = "traffic_statistics.json"
 
