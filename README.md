@@ -82,8 +82,8 @@ pip install ultralytics opencv-python numpy
 text
 traffic_analyzer/
 ├── main.py                 # Основной скрипт
-├── test3.mp4              # Входное видео
-├── analyzed_output.mp4    # Выходное видео
+├── input.mp4              # Входное видео
+├── output.mp4    # Выходное видео
 └── traffic_statistics.json # Статистика
 
 
